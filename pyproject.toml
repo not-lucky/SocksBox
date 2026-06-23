@@ -1,0 +1,16 @@
+[project]
+name = "socksbox"
+version = "0.1.0"
+description = "Proxy toolkit: parse, verify, enrich, and export proxy configurations"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.14.1",
+    "aiohttp-socks>=0.11.0",
+]
+
+[project.scripts]
+socksbox = "socksbox.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
