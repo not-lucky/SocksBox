@@ -8,15 +8,15 @@ import subprocess
 import sys
 import tempfile
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 
 from socksbox.config_gen import generate_singbox_config
+from socksbox.downloader import print_pass_fail_summary, run_download_verification
 from socksbox.enricher import enrich_proxies
 from socksbox.exporter import export_all
 from socksbox.models import ProxyInfo
 from socksbox.parser import load_and_parse
-from socksbox.verifier import verify_proxies
+from socksbox.verifier import DEFAULT_AUDIT_LOG_NAME, verify_proxies
 
 DEFAULT_INPUT = "https://github.com/ebrasha/free-v2ray-public-list/raw/refs/heads/main/V2Ray-Config-By-EbraSha.txt"
 
@@ -36,6 +36,7 @@ async def enrich_with_live_sing_box(
     concurrency: int,
     tokens: list[str] | None,
     verbose: bool,
+    audit_log_path: Path | None = None,
 ) -> list[ProxyInfo]:
     working = [p for p in proxies if p.working]
     if not working:
@@ -64,6 +65,7 @@ async def enrich_with_live_sing_box(
             concurrency=concurrency,
             tokens=tokens,
             verbose=verbose,
+            audit_log_path=audit_log_path,
         )
     finally:
         if proc is not None:
@@ -81,6 +83,24 @@ def write_errors(errors: list[dict], output_dir: Path) -> Path:
     path.write_text(json.dumps(errors, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"Logged {len(errors)} source error(s) to {path}", file=sys.stderr)
     return path
+
+
+def resolve_audit_log_path(audit_log: str | None, output_dir: Path | None) -> Path | None:
+    """Resolve where the forbidden-detection audit log should be written.
+
+    Priority order:
+      1. Explicit ``--audit-log`` argument (always honored, even if empty
+         string disables it).
+      2. ``<output_dir>/<DEFAULT_AUDIT_LOG_NAME>`` when an output directory
+         is provided.
+      3. ``<cwd>/<DEFAULT_AUDIT_LOG_NAME>`` as a last-resort default.
+    """
+    if audit_log is not None:
+        if not audit_log.strip():
+            return None
+        return Path(audit_log)
+    base = output_dir if output_dir is not None else Path(".")
+    return base / DEFAULT_AUDIT_LOG_NAME
 
 
 def _dump_errors(parse_records: list[dict], issues: list[dict], output_dir: Path) -> None:
@@ -131,13 +151,23 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ipinfo-token", default=os.environ.get("IPINFO_TOKEN", ""), help="ipinfo.io API token(s), comma-separated to cycle through multiple (or set IPINFO_TOKEN env var)")
     parser.add_argument("--no-enrich", action="store_true", help="Skip geo enrichment step")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification (INSECURE, use only for testing)")
+    parser.add_argument(
+        "--audit-log", default=None,
+        help=(
+            "Path to the audit log that records every ipinfo.io 403 Forbidden "
+            "detection (proxy IP, SOCKS port, timestamp). Defaults to "
+            "<output_dir>/forbidden_detections.log. Pass an empty string to disable."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
 
 async def cmd_run(args: argparse.Namespace) -> int:
+    output_dir = Path(args.output_dir)
+    audit_log_path = resolve_audit_log_path(args.audit_log, output_dir)
     proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
     if not proxies:
-        _dump_errors(parse_records, issues, Path(args.output_dir))
+        _dump_errors(parse_records, issues, output_dir)
         print("No valid proxies from any source.", file=sys.stderr)
         return 1
 
@@ -148,6 +178,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
             tries=args.tries, timeout=args.timeout, concurrency=args.concurrency,
             target_host=args.target_host, target_port=args.target_port, verbose=args.verbose,
+            audit_log_path=audit_log_path,
         )
     except Exception as exc:
         issues.append({"source": "all", "stage": "verify", "error": str(exc),
@@ -159,7 +190,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     if not working:
         print("No working proxies. Skipping enrichment and export.", file=sys.stderr)
-        _dump_errors(parse_records, issues, Path(args.output_dir))
+        _dump_errors(parse_records, issues, output_dir)
         return 1
 
     if not args.no_enrich:
@@ -172,6 +203,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 concurrency=min(args.concurrency, 50),
                 tokens=parse_tokens(args.ipinfo_token),
                 verbose=args.verbose,
+                audit_log_path=audit_log_path,
             )
         except Exception as exc:
             issues.append({"source": "all", "stage": "enrich", "error": str(exc),
@@ -179,14 +211,65 @@ async def cmd_run(args: argparse.Namespace) -> int:
             print(f"[error] enrich stage: {exc}", file=sys.stderr)
 
     config = generate_singbox_config(working, start_port=args.start_port, listen=args.listen)
-    output_dir = Path(args.output_dir)
     export_all(proxies, config, output_dir, start_port=args.start_port, issues=issues)
 
     _dump_errors(parse_records, issues, output_dir)
+
+    if args.download_test:
+        print("\n=== Concurrent download verification ===", file=sys.stderr)
+        try:
+            download_report = await run_download_verification(
+                working,
+                start_port=args.start_port,
+                listen=args.listen,
+                sing_box=args.sing_box,
+                url=args.download_url,
+                timeout=args.download_timeout,
+                concurrency=max(1, args.download_concurrency),
+                output_dir=output_dir,
+                verbose=args.verbose,
+            )
+        except Exception as exc:
+            issues.append({
+                "source": "all",
+                "stage": "download_test",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            })
+            print(f"[error] download_test stage: {exc}", file=sys.stderr)
+        else:
+            print_pass_fail_summary(download_report)
+            for err in download_report.get("errors", []):
+                issues.append({
+                    "source": "download_test",
+                    "stage": err.get("stage", "download"),
+                    "kind": err.get("error_type"),
+                    "label": err.get("label"),
+                    "socks_port": err.get("socks_port"),
+                    "error": err.get("error"),
+                    "traceback": err.get("traceback"),
+                })
+            if download_report.get("demoted"):
+                final_working = [p for p in working if p.working]
+                final_failed = [p for p in working if not p.working]
+                print(
+                    f"Re-exporting after demotion: {len(final_working)} working / "
+                    f"{len(final_failed)} failed.",
+                    file=sys.stderr,
+                )
+                proxies = working
+                config = generate_singbox_config(final_working, start_port=args.start_port, listen=args.listen)
+                export_all(proxies, config, output_dir, start_port=args.start_port, issues=issues)
+            _dump_errors(parse_records, issues, output_dir)
+
     return 0
 
 
 async def cmd_verify(args: argparse.Namespace) -> int:
+    output_path = Path(args.output)
+    audit_log_path = resolve_audit_log_path(
+        args.audit_log, output_path.parent if output_path.parent else Path(".")
+    )
     proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, Path("."))
@@ -199,10 +282,10 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
         tries=args.tries, timeout=args.timeout, concurrency=args.concurrency,
         target_host=args.target_host, target_port=args.target_port, verbose=args.verbose,
+        audit_log_path=audit_log_path,
     )
 
     working = [p for p in proxies if p.working]
-    output_path = Path(args.output)
     with output_path.open("w", encoding="utf-8") as f:
         f.write(f"# Verified: {len(working)} working / {len(proxies)} total\n\n")
         for p in working:
@@ -220,6 +303,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
 
 
 async def cmd_enrich(args: argparse.Namespace) -> int:
+    audit_log_path = resolve_audit_log_path(args.audit_log, Path("."))
     proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, Path("."))
@@ -232,6 +316,7 @@ async def cmd_enrich(args: argparse.Namespace) -> int:
         proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
         tries=args.tries, timeout=args.timeout, concurrency=args.concurrency,
         target_host=args.target_host, target_port=args.target_port, verbose=args.verbose,
+        audit_log_path=audit_log_path,
     )
 
     working = [p for p in proxies if p.working]
@@ -248,6 +333,7 @@ async def cmd_enrich(args: argparse.Namespace) -> int:
         concurrency=min(args.concurrency, 50),
         tokens=parse_tokens(args.ipinfo_token),
         verbose=args.verbose,
+        audit_log_path=audit_log_path,
     )
 
     for p in working:
@@ -303,6 +389,14 @@ def main():
     p_run = subparsers.add_parser("run", help="Full pipeline: parse, verify, enrich, export")
     add_common_args(p_run)
     p_run.add_argument("--output-dir", default="output", help="Output directory (default: output/)")
+    p_run.add_argument("--download-test", action="store_true",
+                       help="Run an opt-in, concurrent download verification after export to validate working proxies (off by default to keep the pipeline non-intrusive)")
+    p_run.add_argument("--download-url", default="https://speed.cloudflare.com/__down?bytes=1048576",
+                       help="Test URL used for the download verification (default: 1 MiB from Cloudflare)")
+    p_run.add_argument("--download-timeout", type=float, default=30.0,
+                       help="Per-proxy timeout in seconds for the download verification (default: 30)")
+    p_run.add_argument("--download-concurrency", type=int, default=5,
+                       help="Max in-flight download verifications (default: 5). Failed proxies are marked not working and excluded from exports.")
 
     p_verify = subparsers.add_parser("verify", help="Parse and verify proxies")
     add_common_args(p_verify)

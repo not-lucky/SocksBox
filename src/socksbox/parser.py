@@ -196,7 +196,9 @@ def parse_vmess(link):
         outbound["transport"] = transport
     packet_encoding = first(values, "packetEncoding", "packet_encoding")
     if packet_encoding:
-        outbound["packet_encoding"] = str(packet_encoding)
+        pe_str = str(packet_encoding).strip().lower()
+        if pe_str in {"xudp", "packetaddr"}:
+            outbound["packet_encoding"] = pe_str
     label = str(first(values, "ps") or "VMess proxy")
     return outbound, label, "vmess"
 
@@ -235,7 +237,9 @@ def parse_vless(link):
         outbound["transport"] = transport
     packet_encoding = first(query, "packetEncoding", "packet_encoding")
     if packet_encoding:
-        outbound["packet_encoding"] = str(packet_encoding)
+        pe_str = str(packet_encoding).strip().lower()
+        if pe_str in {"xudp", "packetaddr"}:
+            outbound["packet_encoding"] = pe_str
     label = fragment_label(link, "VLESS proxy")
     return outbound, label, "vless"
 
