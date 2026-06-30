@@ -8,19 +8,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from socksbox.models import ProxyInfo
-
-# Markers from Google's 403 Forbidden block page served when an IP has been
-# flagged. The exact substring must appear in the curl response body for the
-# proxy to be considered "not working" by the validation check.
-IPINFO_FORBIDDEN_MARKER = "Your client does not have permission to get URL"
-IPINFO_FORBIDDEN_MARKER_PATH = "<code>/json</code>"
-IPINFO_FORBIDDEN_STATUS = 403
-DEFAULT_AUDIT_LOG_NAME = "forbidden_detections.log"
+from socksbox.runner import SubprocessSingBoxRunner
+from socksbox.status import (
+    DEFAULT_AUDIT_LOG_NAME,
+    IPINFO_FORBIDDEN_MARKER,
+    IPINFO_FORBIDDEN_MARKER_PATH,
+    IPINFO_FORBIDDEN_STATUS,
+    _mark_proxy_not_working,
+    _response_carries_forbidden,
+    log_forbidden_detection,
+)
 
 
 async def test_socks5_latency(
@@ -134,7 +135,7 @@ async def measure_proxy_average_latency(
     return float("inf"), diagnostic
 
 
-def curl_ipinfo_forbidden_check(
+async def curl_ipinfo_forbidden_check(
     proxy_host: str,
     proxy_port: int,
     curl_bin: str = "curl",
@@ -158,16 +159,25 @@ def curl_ipinfo_forbidden_check(
         "ipinfo.io/json",
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout + 2
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout + 2)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            return False, None
     except FileNotFoundError:
         print(f"[forbidden-check] curl not found at {curl_bin!r}; skipping.", file=sys.stderr)
         return False, None
-    except subprocess.TimeoutExpired:
-        return False, None
 
-    body = (result.stdout or "") + (result.stderr or "")
+    body = (stdout.decode("utf-8", errors="ignore") or "") + (stderr.decode("utf-8", errors="ignore") or "")
     status: int | None = None
     if "__HTTP_STATUS__:" in body:
         try:
@@ -176,60 +186,10 @@ def curl_ipinfo_forbidden_check(
         except (ValueError, IndexError):
             status = None
 
-    is_blocked = (
-        status == IPINFO_FORBIDDEN_STATUS
-        and IPINFO_FORBIDDEN_MARKER in body
-        and IPINFO_FORBIDDEN_MARKER_PATH in body
-    )
+    is_blocked = status == IPINFO_FORBIDDEN_STATUS and _response_carries_forbidden(body)
     return is_blocked, status
 
 
-def _mark_proxy_not_working(
-    proxy: ProxyInfo,
-    reason: str,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    """Flip a proxy's status to not working and record diagnostics."""
-    proxy.latency_ms = float("inf")
-    forbidden_diag = proxy.diagnostics.setdefault("forbidden_check", {})
-    record: dict[str, Any] = {
-        "status": "not_working",
-        "reason": reason,
-        "detected_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if extra:
-        record.update(extra)
-    forbidden_diag.update(record)
-
-
-def log_forbidden_detection(
-    proxy: ProxyInfo,
-    socks_port: int,
-    audit_log_path: Path | None = None,
-    http_status: int | None = None,
-) -> None:
-    """Emit an audit log entry for a forbidden-response detection.
-
-    The entry always includes the proxy's IP (resolved via the proxy when
-    available, falling back to its label/link), the local SOCKS5 port that
-    was probed, and an ISO-8601 UTC timestamp. When ``audit_log_path`` is
-    provided, the entry is also appended to that file for persistent
-    auditing.
-    """
-    timestamp = datetime.now(timezone.utc).isoformat()
-    proxy_ip = proxy.ip or proxy.label or proxy.link
-    message = (
-        f"[{timestamp}] proxy_marked_not_working "
-        f"reason=ipinfo_forbidden_403 "
-        f"http_status={http_status if http_status is not None else 'unknown'} "
-        f"socks_port={socks_port} "
-        f"proxy_ip={proxy_ip}"
-    )
-    print(message, file=sys.stderr)
-    if audit_log_path is not None:
-        audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with audit_log_path.open("a", encoding="utf-8") as f:
-            f.write(message + "\n")
 
 
 def _build_config_for_indices(
@@ -354,91 +314,100 @@ async def verify_proxies(
     for seq, idx in enumerate(active):
         port_map[seq] = idx
 
-    proc = None
+    config = _build_config_for_indices(proxies, active, start_port, listen)
     try:
-        print("Starting sing-box testing instance...", file=sys.stderr)
-        proc = subprocess.Popen(
-            [sing_box, "run", "-c", str(temp_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        await asyncio.sleep(2.0)
-        if proc.poll() is not None:
-            print("Error: sing-box terminated early.", file=sys.stderr)
-            return proxies
+        async with SubprocessSingBoxRunner(
+            config,
+            sing_box=sing_box,
+            listen=listen,
+            start_port=start_port,
+            startup_delay=2.0,
+        ) as runner:
+            total = len(active)
+            print(f"Testing {total} proxies (averaging {tries} tries per proxy)...", file=sys.stderr)
 
-        total = len(active)
-        print(f"Testing {total} proxies (averaging {tries} tries per proxy)...", file=sys.stderr)
+            sem = asyncio.Semaphore(concurrency)
+            completed = 0
 
-        sem = asyncio.Semaphore(concurrency)
-        completed = 0
-
-        async def worker(seq: int) -> tuple[int, float]:
-            nonlocal completed
-            async with sem:
-                avg_lat, diagnostic = await measure_proxy_average_latency(
-                    listen, start_port + seq,
-                    target_host=target_host, target_port=target_port,
-                    tries=tries, timeout=timeout, verbose=verbose,
-                )
-                proxies[port_map[seq]].diagnostics["verify"] = diagnostic
-                completed += 1
-                print(f"Progress: {completed}/{total} processed...", end="\r", file=sys.stderr)
-                return port_map[seq], avg_lat
-
-        tasks = [worker(seq) for seq in range(total)]
-        results = await asyncio.gather(*tasks)
-        print("", file=sys.stderr)
-
-        # Assign latency results while sing-box is still alive.
-        for real_idx, latency in results:
-            proxies[real_idx].latency_ms = latency
-
-        # Universal health gate: probe every working proxy with curl through
-        # the local SOCKS5 endpoint. If the response carries the 403
-        # Forbidden block page served for ipinfo.io/json, immediately flip
-        # the proxy to "not working" and record an audit log entry.
-        real_to_seq = {real_idx: seq for seq, real_idx in port_map.items()}
-        working_real_indices = [
-            real_idx for real_idx, lat in results if lat != float("inf")
-        ]
-        if working_real_indices:
-            print(
-                f"Running ipinfo.io forbidden-response check on "
-                f"{len(working_real_indices)} working proxies...",
-                file=sys.stderr,
-            )
-            for real_idx in working_real_indices:
-                seq = real_to_seq[real_idx]
-                port = start_port + seq
-                is_blocked, http_status = curl_ipinfo_forbidden_check(
-                    listen, port, timeout=max(5.0, timeout + 2.0)
-                )
-                if is_blocked:
-                    _mark_proxy_not_working(
-                        proxies[real_idx],
-                        reason="ipinfo.io forbidden 403 response",
-                        extra={
-                            "http_status": http_status,
-                            "socks_port": port,
-                            "check_command": (
-                                f"curl --socks5 {listen}:{port} ipinfo.io/json"
-                            ),
-                        },
+            async def worker(seq: int) -> tuple[int, float]:
+                nonlocal completed
+                async with sem:
+                    avg_lat, diagnostic = await measure_proxy_average_latency(
+                        runner.listen, runner.start_port + seq,
+                        target_host=target_host, target_port=target_port,
+                        tries=tries, timeout=timeout, verbose=verbose,
                     )
-                    log_forbidden_detection(
-                        proxies[real_idx],
-                        socks_port=port,
-                        audit_log_path=audit_log_path,
-                        http_status=http_status,
-                    )
+                    proxies[port_map[seq]].diagnostics["verify"] = diagnostic
+                    completed += 1
+                    print(f"Progress: {completed}/{total} processed...", end="\r", file=sys.stderr)
+                    return port_map[seq], avg_lat
 
+            tasks = [worker(seq) for seq in range(total)]
+            results = await asyncio.gather(*tasks)
+            print("", file=sys.stderr)
+
+            # Assign latency results while sing-box is still alive.
+            for real_idx, latency in results:
+                proxies[real_idx].latency_ms = latency
+
+            # Universal health gate: probe every working proxy with curl through
+            # the local SOCKS5 endpoint. If the response carries the 403
+            # Forbidden block page served for ipinfo.io/json, immediately flip
+            # the proxy to "not working" and record an audit log entry.
+            real_to_seq = {real_idx: seq for seq, real_idx in port_map.items()}
+            working_real_indices = [
+                real_idx for real_idx, lat in results if lat != float("inf")
+            ]
+            if working_real_indices:
+                print(
+                    f"Running ipinfo.io forbidden-response check on "
+                    f"{len(working_real_indices)} working proxies...",
+                    file=sys.stderr,
+                )
+                check_sem = asyncio.Semaphore(min(concurrency, 100))
+                completed_checks = 0
+                total_checks = len(working_real_indices)
+
+                async def check_worker(real_idx: int):
+                    nonlocal completed_checks
+                    seq = real_to_seq[real_idx]
+                    port = runner.start_port + seq
+                    async with check_sem:
+                        is_blocked, http_status = await curl_ipinfo_forbidden_check(
+                            runner.listen, port, timeout=max(5.0, timeout + 2.0)
+                        )
+                    completed_checks += 1
+                    print(
+                        f"Forbidden check progress: {completed_checks}/{total_checks} processed...",
+                        end="\r",
+                        file=sys.stderr,
+                    )
+                    if is_blocked:
+                        _mark_proxy_not_working(
+                            proxies[real_idx],
+                            reason="ipinfo.io forbidden 403 response",
+                            extra={
+                                "http_status": http_status,
+                                "socks_port": port,
+                                "check_command": (
+                                    f"curl --socks5 {runner.listen}:{port} ipinfo.io/json"
+                                ),
+                            },
+                        )
+                        log_forbidden_detection(
+                            proxies[real_idx],
+                            socks_port=port,
+                            audit_log_path=audit_log_path,
+                            http_status=http_status,
+                        )
+
+                check_tasks = [check_worker(real_idx) for real_idx in working_real_indices]
+                await asyncio.gather(*check_tasks)
+                print("", file=sys.stderr)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return proxies
     finally:
-        if proc is not None:
-            print("Stopping sing-box testing instance...", file=sys.stderr)
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
         temp_path.unlink(missing_ok=True)
 
     proxies.sort(key=lambda p: p.latency_ms)

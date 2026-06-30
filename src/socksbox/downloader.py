@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
@@ -17,6 +15,7 @@ from aiohttp_socks import SocksConnector
 
 from socksbox.config_gen import generate_singbox_config
 from socksbox.models import ProxyInfo
+from socksbox.runner import SubprocessSingBoxRunner
 
 
 DEFAULT_DOWNLOAD_URL = (
@@ -157,112 +156,105 @@ async def run_download_verification(
             _write_report(report, output_dir)
         return report
 
-    temp_fd, temp_name = tempfile.mkstemp(suffix=".json", prefix="socksbox_dl_")
-    temp_path = Path(temp_name)
-    os.close(temp_fd)
     config = generate_singbox_config(working, start_port=start_port, listen=listen)
-    temp_path.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    runner = SubprocessSingBoxRunner(
+        config,
+        sing_box=sing_box,
+        listen=listen,
+        start_port=start_port,
+        startup_delay=2.0,
     )
 
-    proc: subprocess.Popen | None = None
     try:
-        print(
-            f"Starting sing-box for download verification "
-            f"({len(working)} proxies, concurrency={concurrency})...",
-            file=sys.stderr,
-        )
-        proc = subprocess.Popen(
-            [sing_box, "run", "-c", str(temp_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        await asyncio.sleep(2.0)
-        if proc.poll() is not None:
-            raise RuntimeError("sing-box terminated early during download test setup")
+        async with runner as endpoint:
+            print(
+                f"Starting sing-box for download verification "
+                f"({len(working)} proxies, concurrency={concurrency})...",
+                file=sys.stderr,
+            )
 
-        sem = asyncio.Semaphore(max(1, concurrency))
-        completed = 0
-        total = len(working)
+            sem = asyncio.Semaphore(max(1, concurrency))
+            completed = 0
+            total = len(working)
 
-        async def worker(idx: int, proxy: ProxyInfo) -> tuple[int, dict[str, Any]]:
-            nonlocal completed
-            port = start_port + idx
-            label = " ".join(str(proxy.label).split())
-            async with sem:
-                if verbose:
-                    print(f"[download] {idx + 1}/{total} -> {label}", file=sys.stderr)
-                record = await download_through_proxy(
-                    listen=listen,
-                    socks_port=port,
-                    url=url,
-                    timeout=timeout,
-                    label=label,
-                )
-                completed += 1
-                print(
-                    f"Download progress: {completed}/{total}...",
-                    end="\r",
-                    file=sys.stderr,
-                )
-                return idx, record
-
-        tasks = [worker(idx, proxy) for idx, proxy in enumerate(working)]
-        outcomes = await asyncio.gather(*tasks)
-        print("", file=sys.stderr)
-
-        for idx, record in outcomes:
-            proxy = working[idx]
-            port = start_port + idx
-            result = {
-                "index": idx + 1,
-                "socks_port": port,
-                "link": proxy.link,
-                "protocol": proxy.protocol,
-                "label": proxy.label,
-                "latency_ms": round(proxy.latency_ms, 1),
-                "country_code": proxy.country_code,
-                **record,
-            }
-            report["results"].append(result)
-            diag = proxy.diagnostics.setdefault("download_test", {})
-            diag.update({
-                "status": record["status"],
-                "url": url,
-                "bytes_downloaded": record["bytes_downloaded"],
-                "elapsed_s": record["elapsed_s"],
-                "speed_kbps": record["speed_kbps"],
-                "http_status": record["http_status"],
-            })
-            if record["status"] == "ok":
-                report["passed"] += 1
-                if verbose:
+            async def worker(idx: int, proxy: ProxyInfo) -> tuple[int, dict[str, Any]]:
+                nonlocal completed
+                port = endpoint.start_port + idx
+                label = " ".join(str(proxy.label).split())
+                async with sem:
+                    if verbose:
+                        print(f"[download] {idx + 1}/{total} -> {label}", file=sys.stderr)
+                    record = await download_through_proxy(
+                        listen=endpoint.listen,
+                        socks_port=port,
+                        url=url,
+                        timeout=timeout,
+                        label=label,
+                    )
+                    completed += 1
                     print(
-                        f"  [ok] {proxy.label}: {record['speed_kbps']:.1f} KiB/s "
-                        f"({record['bytes_downloaded']} bytes in {record['elapsed_s']:.2f}s)",
+                        f"Download progress: {completed}/{total}...",
+                        end="\r",
                         file=sys.stderr,
                     )
-            else:
-                report["failed"] += 1
-                diag.update({
-                    "error_type": record.get("error_type", "Unknown"),
-                    "error": record.get("error", "unknown failure"),
-                })
-                report["errors"].append({
-                    "stage": "download",
-                    "proxy_index": idx + 1,
+                    return idx, record
+
+            tasks = [worker(idx, proxy) for idx, proxy in enumerate(working)]
+            outcomes = await asyncio.gather(*tasks)
+            print("", file=sys.stderr)
+
+            for idx, record in outcomes:
+                proxy = working[idx]
+                port = endpoint.start_port + idx
+                result = {
+                    "index": idx + 1,
                     "socks_port": port,
-                    "label": proxy.label,
                     "link": proxy.link,
-                    "error_type": record.get("error_type", "Unknown"),
-                    "error": record.get("error", "unknown failure"),
-                    "traceback": record.get("traceback"),
+                    "protocol": proxy.protocol,
+                    "label": proxy.label,
+                    "latency_ms": round(proxy.latency_ms, 1),
+                    "country_code": proxy.country_code,
+                    **record,
+                }
+                report["results"].append(result)
+                diag = proxy.diagnostics.setdefault("download_test", {})
+                diag.update({
+                    "status": record["status"],
+                    "url": url,
+                    "bytes_downloaded": record["bytes_downloaded"],
+                    "elapsed_s": record["elapsed_s"],
+                    "speed_kbps": record["speed_kbps"],
+                    "http_status": record["http_status"],
                 })
-                if demote_on_failure:
-                    proxy.latency_ms = float("inf")
-                    report["demoted"] += 1
+                if record["status"] == "ok":
+                    report["passed"] += 1
                     if verbose:
-                        print(f"  [demote] {proxy.label}: marked not working", file=sys.stderr)
+                        print(
+                            f"  [ok] {proxy.label}: {record['speed_kbps']:.1f} KiB/s "
+                            f"({record['bytes_downloaded']} bytes in {record['elapsed_s']:.2f}s)",
+                            file=sys.stderr,
+                        )
+                else:
+                    report["failed"] += 1
+                    diag.update({
+                        "error_type": record.get("error_type", "Unknown"),
+                        "error": record.get("error", "unknown failure"),
+                    })
+                    report["errors"].append({
+                        "stage": "download",
+                        "proxy_index": idx + 1,
+                        "socks_port": port,
+                        "label": proxy.label,
+                        "link": proxy.link,
+                        "error_type": record.get("error_type", "Unknown"),
+                        "error": record.get("error", "unknown failure"),
+                        "traceback": record.get("traceback"),
+                    })
+                    if demote_on_failure:
+                        proxy.latency_ms = float("inf")
+                        report["demoted"] += 1
+                        if verbose:
+                            print(f"  [demote] {proxy.label}: marked not working", file=sys.stderr)
 
     except Exception as exc:
         report["errors"].append({
@@ -272,14 +264,6 @@ async def run_download_verification(
             "traceback": traceback.format_exc(),
         })
         print(f"[download-test] runner failure: {exc}", file=sys.stderr)
-    finally:
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        temp_path.unlink(missing_ok=True)
 
     if report["tested_proxies"] > 0:
         report["success_rate"] = round(report["passed"] / report["tested_proxies"], 4)

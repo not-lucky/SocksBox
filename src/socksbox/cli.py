@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import traceback
 from pathlib import Path
 
@@ -15,8 +13,10 @@ from socksbox.downloader import print_pass_fail_summary, run_download_verificati
 from socksbox.enricher import enrich_proxies
 from socksbox.exporter import export_all
 from socksbox.models import ProxyInfo
-from socksbox.parser import load_and_parse
-from socksbox.verifier import DEFAULT_AUDIT_LOG_NAME, verify_proxies
+from socksbox.runner import SubprocessSingBoxRunner
+from socksbox.sources import DEFAULT_SOURCES
+from socksbox.status import DEFAULT_AUDIT_LOG_NAME
+from socksbox.verifier import verify_proxies
 
 DEFAULT_INPUT = "https://github.com/ebrasha/free-v2ray-public-list/raw/refs/heads/main/V2Ray-Config-By-EbraSha.txt"
 
@@ -42,39 +42,23 @@ async def enrich_with_live_sing_box(
     if not working:
         return proxies
 
-    temp_fd, temp_name = tempfile.mkstemp(suffix=".json", prefix="socksbox_enrich_")
-    temp_path = Path(temp_name)
-    os.close(temp_fd)
     config = generate_singbox_config(working, start_port=start_port, listen=listen)
-    temp_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-    proc = subprocess.Popen(
-        [sing_box, "run", "-c", str(temp_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        await asyncio.sleep(2.0)
-        if proc.poll() is not None:
-            raise RuntimeError("Error: sing-box terminated early.")
-
+    async with SubprocessSingBoxRunner(
+        config,
+        sing_box=sing_box,
+        listen=listen,
+        start_port=start_port,
+        startup_delay=2.0,
+    ) as endpoint:
         return await enrich_proxies(
             proxies,
-            start_port=start_port,
-            listen=listen,
+            start_port=endpoint.start_port,
+            listen=endpoint.listen,
             concurrency=concurrency,
             tokens=tokens,
             verbose=verbose,
             audit_log_path=audit_log_path,
         )
-    finally:
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        temp_path.unlink(missing_ok=True)
 
 
 def write_errors(errors: list[dict], output_dir: Path) -> Path:
@@ -109,37 +93,55 @@ def _dump_errors(parse_records: list[dict], issues: list[dict], output_dir: Path
         write_errors(combined, output_dir)
 
 
-def load_sources(sources: list[str], verify_ssl: bool = True) -> tuple[list[ProxyInfo], list[dict], list[dict]]:
+def load_sources(verify_ssl: bool = True) -> tuple[list[ProxyInfo], list[dict], list[dict]]:
     if not verify_ssl:
         print("Warning: SSL certificate verification is disabled. This is insecure and should only be used for testing.", file=sys.stderr)
     all_proxies: list[ProxyInfo] = []
     parse_records: list[dict] = []
     issues: list[dict] = []
-    for source in sources:
+
+    for source in DEFAULT_SOURCES:
+        source_url = getattr(source, "url", "unknown")
+        prints_summary = getattr(source, "prints_summary", True)
         try:
-            proxies, records = load_and_parse(source, verify_ssl=verify_ssl)
-            for record in records:
-                enriched_record = dict(record)
-                enriched_record.setdefault("source", source)
-                parse_records.append(enriched_record)
-                if enriched_record.get("status") == "failed":
-                    issues.append(dict(enriched_record))
-            if not proxies:
-                issues.append({"source": source, "stage": "parse", "status": "failed", "kind": "empty_input", "error": "no valid proxies found"})
-                print(f"[skip] {source}: no valid proxies found", file=sys.stderr)
-                continue
-            print(f"[ok] {source}: {len(proxies)} proxies", file=sys.stderr)
-            all_proxies.extend(proxies)
+            proxies, records = source.load(verify_ssl=verify_ssl)
         except Exception as exc:
-            issues.append({"source": source, "stage": "load", "error": str(exc),
-                           "traceback": traceback.format_exc()})
-            print(f"[error] {source}: {exc}", file=sys.stderr)
+            issues.append({
+                "source": source_url,
+                "stage": "load",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            })
+            if prints_summary:
+                print(f"[error] {source_url}: {exc}", file=sys.stderr)
+            continue
+
+        for record in records:
+            enriched_record = dict(record)
+            enriched_record.setdefault("source", source_url)
+            parse_records.append(enriched_record)
+            if enriched_record.get("status") == "failed":
+                issues.append(dict(enriched_record))
+
+        if not proxies:
+            issues.append({
+                "source": source_url,
+                "stage": "parse",
+                "status": "failed",
+                "kind": "empty_input",
+                "error": "no valid proxies found",
+            })
+            if prints_summary:
+                print(f"[skip] {source_url}: no valid proxies found", file=sys.stderr)
+        else:
+            if prints_summary:
+                print(f"[ok] {source_url}: {len(proxies)} proxies", file=sys.stderr)
+            all_proxies.extend(proxies)
+
     return all_proxies, parse_records, issues
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("inputs", nargs="*", default=[DEFAULT_INPUT],
-                        help="Input sources: file paths, URLs, or '-' for stdin (multiple allowed)")
     parser.add_argument("--start-port", type=int, default=10808, help="First SOCKS port (default: 10808)")
     parser.add_argument("--listen", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
     parser.add_argument("--concurrency", type=int, default=100, help="Max concurrent operations (default: 100)")
@@ -165,13 +167,13 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 async def cmd_run(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     audit_log_path = resolve_audit_log_path(args.audit_log, output_dir)
-    proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
+    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, output_dir)
         print("No valid proxies from any source.", file=sys.stderr)
         return 1
 
-    print(f"Total: {len(proxies)} proxies from {len(args.inputs)} source(s).", file=sys.stderr)
+    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s).", file=sys.stderr)
 
     try:
         proxies = await verify_proxies(
@@ -270,13 +272,13 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     audit_log_path = resolve_audit_log_path(
         args.audit_log, output_path.parent if output_path.parent else Path(".")
     )
-    proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
+    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, Path("."))
         print("No valid proxies from any source.", file=sys.stderr)
         return 1
 
-    print(f"Total: {len(proxies)} proxies from {len(args.inputs)} source(s).", file=sys.stderr)
+    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s).", file=sys.stderr)
 
     proxies = await verify_proxies(
         proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
@@ -304,13 +306,13 @@ async def cmd_verify(args: argparse.Namespace) -> int:
 
 async def cmd_enrich(args: argparse.Namespace) -> int:
     audit_log_path = resolve_audit_log_path(args.audit_log, Path("."))
-    proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
+    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, Path("."))
         print("No valid proxies from any source.", file=sys.stderr)
         return 1
 
-    print(f"Total: {len(proxies)} proxies from {len(args.inputs)} source(s).", file=sys.stderr)
+    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s).", file=sys.stderr)
 
     proxies = await verify_proxies(
         proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
@@ -345,13 +347,13 @@ async def cmd_enrich(args: argparse.Namespace) -> int:
 
 
 def cmd_parse(args: argparse.Namespace) -> int:
-    proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
+    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, Path("."))
         print("No valid proxies from any source.", file=sys.stderr)
         return 1
 
-    print(f"Total: {len(proxies)} proxies from {len(args.inputs)} source(s):\n")
+    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s):\n")
     from collections import Counter
     by_proto = Counter(p.protocol for p in proxies)
     for proto, count in by_proto.most_common():
@@ -366,7 +368,7 @@ def cmd_parse(args: argparse.Namespace) -> int:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    proxies, parse_records, issues = load_sources(args.inputs, verify_ssl=not args.no_verify_ssl)
+    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
     if not proxies:
         _dump_errors(parse_records, issues, Path("."))
         print("No valid proxies from any source.", file=sys.stderr)
@@ -406,11 +408,9 @@ def main():
     add_common_args(p_enrich)
 
     p_parse = subparsers.add_parser("parse", help="Parse and display proxy info")
-    p_parse.add_argument("inputs", nargs="*", default=["-"], help="Input sources (multiple allowed)")
     p_parse.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification (INSECURE, use only for testing)")
 
     p_config = subparsers.add_parser("config", help="Generate sing-box config (no verification)")
-    p_config.add_argument("inputs", nargs="*", default=["-"], help="Input sources (multiple allowed)")
     p_config.add_argument("-o", "--output", default="config.json", help="Output config file")
     p_config.add_argument("--start-port", type=int, default=10808)
     p_config.add_argument("--listen", default="127.0.0.1")

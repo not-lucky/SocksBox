@@ -4,27 +4,20 @@ import asyncio
 import itertools
 import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 from aiohttp_socks import SocksConnector
 
 from socksbox.models import ProxyInfo
-from socksbox.verifier import (
+from socksbox.status import (
     IPINFO_FORBIDDEN_MARKER,
     IPINFO_FORBIDDEN_MARKER_PATH,
     IPINFO_FORBIDDEN_STATUS,
     _mark_proxy_not_working,
+    _response_carries_forbidden,
     log_forbidden_detection,
 )
-
-
-def _response_carries_forbidden(text: str) -> bool:
-    return (
-        IPINFO_FORBIDDEN_MARKER in text
-        and IPINFO_FORBIDDEN_MARKER_PATH in text
-    )
 
 
 async def enrich_proxy(
