@@ -69,8 +69,12 @@ def test_default_adapters_expose_source_urls() -> None:
 def test_url_text_adapter_labels_records(monkeypatch: Any) -> None:
     proxy = _make_proxy()
     monkeypatch.setattr(
-        "socksbox.sources.url_text.load_and_parse",
-        lambda source, verify_ssl=True: ([proxy], [{"status": "ok"}]),
+        "socksbox.sources.url_text.parse_links_text",
+        lambda text: ([proxy], [{"status": "ok"}]),
+    )
+    monkeypatch.setattr(
+        "socksbox.sources.url_text.load_input",
+        lambda source, verify_ssl=True: "some text",
     )
 
     source = UrlTextSource("https://example.com/list.txt")
@@ -83,8 +87,12 @@ def test_url_text_adapter_labels_records(monkeypatch: Any) -> None:
 def test_url_text_adapter_preserves_existing_source_label(monkeypatch: Any) -> None:
     proxy = _make_proxy()
     monkeypatch.setattr(
-        "socksbox.sources.url_text.load_and_parse",
-        lambda source, verify_ssl=True: ([proxy], [{"source": "existing", "status": "ok"}]),
+        "socksbox.sources.url_text.parse_links_text",
+        lambda text: ([proxy], [{"source": "existing", "status": "ok"}]),
+    )
+    monkeypatch.setattr(
+        "socksbox.sources.url_text.load_input",
+        lambda source, verify_ssl=True: "some text",
     )
 
     source = UrlTextSource("https://example.com/list.txt")
@@ -96,8 +104,14 @@ def test_url_text_adapter_preserves_existing_source_label(monkeypatch: Any) -> N
 def test_shadowmere_adapter_labels_records(monkeypatch: Any) -> None:
     proxy = _make_proxy()
     monkeypatch.setattr(
-        "socksbox.sources.shadowmere.load_shadowmere_json",
-        lambda verify_ssl=True: ([proxy], [{"status": "ok"}]),
+        ShadowmereSource,
+        "_parse",
+        lambda self, data: ([proxy], [{"status": "ok"}]),
+    )
+    monkeypatch.setattr(
+        ShadowmereSource,
+        "_fetch",
+        lambda self, verify_ssl=True: b"[]",
     )
 
     source = ShadowmereSource()
@@ -110,8 +124,14 @@ def test_shadowmere_adapter_labels_records(monkeypatch: Any) -> None:
 def test_proxyscrape_adapter_labels_records(monkeypatch: Any) -> None:
     proxy = _make_proxy()
     monkeypatch.setattr(
-        "socksbox.sources.proxyscrape.load_proxyscrape_json",
-        lambda verify_ssl=True: ([proxy], [{"status": "ok"}]),
+        ProxyscrapeSource,
+        "_parse",
+        lambda self, data: ([proxy], [{"status": "ok"}]),
+    )
+    monkeypatch.setattr(
+        ProxyscrapeSource,
+        "_fetch",
+        lambda self, verify_ssl=True: b"{}",
     )
 
     source = ProxyscrapeSource()

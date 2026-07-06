@@ -22,6 +22,9 @@ def _dummy_proxy() -> ProxyInfo:
 class _DummySource:
     """Minimal source implementation for protocol/runtime checks."""
 
+    url: str = "dummy"
+    prints_summary: bool = True
+
     def load(self, verify_ssl: bool = True) -> LoadResult:
         return LoadResult(proxies=[_dummy_proxy()], records=[{"source": "dummy"}])
 

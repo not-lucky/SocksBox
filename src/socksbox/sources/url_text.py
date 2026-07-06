@@ -1,17 +1,14 @@
-"""Plain-text URL source adapter for SocksBox."""
+"""Plain-text URL source adapter for SocksBox using Template Method."""
 
 from __future__ import annotations
 
-from socksbox.parser import load_and_parse
-from socksbox.sources.base import LoadResult
+from socksbox.models import ProxyInfo
+from socksbox.parsing.loader import load_input, parse_links_text
+from socksbox.sources.base import BaseSource
 
 
-class UrlTextSource:
-    """Load and parse a plain-text subscription URL.
-
-    This adapter wraps :func:`socksbox.parser.load_and_parse` and self-labels
-    every diagnostic record with the source URL.
-    """
+class UrlTextSource(BaseSource):
+    """Load and parse a plain-text subscription URL."""
 
     url: str = (
         "https://github.com/ebrasha/free-v2ray-public-list/raw/refs/heads/main/"
@@ -23,23 +20,11 @@ class UrlTextSource:
         if url is not None:
             self.url = url
 
-    def load(self, verify_ssl: bool = True) -> LoadResult:
-        """Fetch and parse the configured plain-text URL.
+    def _fetch(self, verify_ssl: bool) -> bytes:
+        return load_input(self.url, verify_ssl=verify_ssl).encode("utf-8")
 
-        Args:
-            verify_ssl: Whether to verify TLS certificates when fetching data.
-
-        Returns:
-            A :class:`~socksbox.sources.base.LoadResult` containing the parsed
-            proxies and diagnostic records.
-        """
-        proxies, records = load_and_parse(self.url, verify_ssl=verify_ssl)
-        labelled_records = []
-        for record in records:
-            enriched = dict(record)
-            enriched.setdefault("source", self.url)
-            labelled_records.append(enriched)
-        return LoadResult(proxies=proxies, records=labelled_records)
+    def _parse(self, data: str) -> tuple[list[ProxyInfo], list[dict]]:
+        return parse_links_text(data)
 
 
 DEFAULT_URL_TEXT_SOURCE = UrlTextSource()

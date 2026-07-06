@@ -2,22 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import json
 import sys
 from pathlib import Path
 
-import aiohttp
-from aiohttp_socks import SocksConnector
-
 from socksbox.models import ProxyInfo
-from socksbox.status import (
-    IPINFO_FORBIDDEN_MARKER,
-    IPINFO_FORBIDDEN_MARKER_PATH,
-    IPINFO_FORBIDDEN_STATUS,
-    _mark_proxy_not_working,
-    _response_carries_forbidden,
-    log_forbidden_detection,
-)
+from socksbox.enrichment import BaseEnricher, GeoEnricher
 
 
 async def enrich_proxy(
@@ -28,80 +17,12 @@ async def enrich_proxy(
     timeout: float = 10.0,
     audit_log_path: Path | None = None,
 ) -> ProxyInfo:
-    url = "https://ipinfo.io/json"
-    if token:
-        url += f"?token={token}"
-    enrich_diag = proxy.diagnostics.setdefault("enrich", {})
-    enrich_diag.update({"status": "started", "socks_port": socks_port, "listen": listen, "url": url})
-    try:
-        connector = SocksConnector.from_url(f"socks5://{listen}:{socks_port}")
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                enrich_diag["http_status"] = resp.status
-                body_text = await resp.text()
-                if (
-                    resp.status == IPINFO_FORBIDDEN_STATUS
-                    and _response_carries_forbidden(body_text)
-                ):
-                    _mark_proxy_not_working(
-                        proxy,
-                        reason="ipinfo.io forbidden 403 response",
-                        extra={
-                            "http_status": resp.status,
-                            "socks_port": socks_port,
-                            "check_command": (
-                                f"curl --socks5 {listen}:{socks_port} ipinfo.io/json"
-                            ),
-                        },
-                    )
-                    log_forbidden_detection(
-                        proxy,
-                        socks_port=socks_port,
-                        audit_log_path=audit_log_path,
-                        http_status=resp.status,
-                    )
-                    enrich_diag.update({"status": "failed", "reason": "ipinfo_forbidden_403"})
-                    return proxy
-                if resp.status != 200:
-                    enrich_diag.update({"status": "failed", "reason": "non_200_response"})
-                    return proxy
-                try:
-                    data = json.loads(body_text) if body_text else None
-                except json.JSONDecodeError:
-                    enrich_diag.update({"status": "failed", "reason": "invalid_json_payload"})
-                    return proxy
-                if not isinstance(data, dict):
-                    enrich_diag.update({"status": "failed", "reason": "invalid_json_payload"})
-                    return proxy
-                proxy.raw_geo = data
-                proxy.ip = str(data.get("ip", ""))
-                proxy.country_code = str(data.get("country", ""))
-                proxy.city = str(data.get("city", ""))
-                proxy.region = str(data.get("region", ""))
-                proxy.org = str(data.get("org", ""))
-                proxy.timezone = str(data.get("timezone", ""))
-                proxy.country = proxy.country_code
-                enrich_diag.update(
-                    {
-                        "status": "ok",
-                        "ip": proxy.ip,
-                        "country_code": proxy.country_code,
-                        "city": proxy.city,
-                        "region": proxy.region,
-                        "org": proxy.org,
-                        "timezone": proxy.timezone,
-                    }
-                )
-    except Exception as exc:
-        enrich_diag.update(
-            {
-                "status": "failed",
-                "reason": "exception",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-        )
-    return proxy
+    """Enrich a single proxy by delegating to the GeoEnricher decorator chain."""
+    core = BaseEnricher()
+    decorator = GeoEnricher(core)
+    return await decorator.enrich(
+        proxy, socks_port, listen=listen, token=token, timeout=timeout, audit_log_path=audit_log_path
+    )
 
 
 async def enrich_proxies(

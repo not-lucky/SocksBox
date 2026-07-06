@@ -1,11 +1,3 @@
-"""Sing-box subprocess lifecycle runner seam.
-
-This module isolates the repeated pattern of writing a temporary sing-box
-configuration, starting a subprocess, waiting for it to be ready, and
-cleaning everything up on exit. Production code uses ``SubprocessSingBoxRunner``;
-tests can use ``FakeSingBoxRunner`` to avoid spawning real processes.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,9 +5,10 @@ import json
 import os
 import subprocess
 import tempfile
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -26,32 +19,24 @@ class SingBoxEndpoint:
     start_port: int
 
 
-@runtime_checkable
-class SingBoxRunner(Protocol):
-    """Protocol for adapters that manage a sing-box subprocess lifecycle."""
+class RunnerImplementation(ABC):
+    """Bridge Pattern - Implementation Interface."""
 
-    async def __aenter__(self) -> SingBoxEndpoint: ...
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: Any,
-    ) -> None: ...
+    @abstractmethod
+    async def start(self) -> SingBoxEndpoint:
+        ...
+
+    @abstractmethod
+    async def stop(self) -> None:
+        ...
 
 
-class SubprocessSingBoxRunner:
-    """Production adapter that runs a real sing-box subprocess.
-
-    The runner writes ``config`` to a temporary JSON file, spawns
-    ``sing-box run -c <file>``, waits ``startup_delay`` seconds, and then
-    verifies the process is still alive. On exit the process is terminated,
-    killed if necessary, and the temporary file is removed.
-    """
+class SubprocessImplementation(RunnerImplementation):
+    """Bridge Pattern - Concrete Implementation managing a real sing-box subprocess."""
 
     def __init__(
         self,
         config: dict[str, Any],
-        *,
         sing_box: str = "sing-box",
         listen: str = "127.0.0.1",
         start_port: int = 10808,
@@ -65,7 +50,7 @@ class SubprocessSingBoxRunner:
         self._proc: subprocess.Popen | None = None
         self._temp_path: Path | None = None
 
-    async def __aenter__(self) -> SingBoxEndpoint:
+    async def start(self) -> SingBoxEndpoint:
         fd, name = tempfile.mkstemp(suffix=".json", prefix="socksbox_runner_")
         self._temp_path = Path(name)
         os.close(fd)
@@ -95,12 +80,7 @@ class SubprocessSingBoxRunner:
 
         return SingBoxEndpoint(listen=self.listen, start_port=self.start_port)
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: Any,
-    ) -> None:
+    async def stop(self) -> None:
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -129,20 +109,28 @@ class SubprocessSingBoxRunner:
             self._temp_path = None
 
 
-class FakeSingBoxRunner:
-    """Test adapter that yields an endpoint without touching any subprocess."""
+class FakeImplementation(RunnerImplementation):
+    """Bridge Pattern - Concrete Implementation for testing."""
 
-    def __init__(
-        self,
-        *,
-        listen: str = "127.0.0.1",
-        start_port: int = 10808,
-    ) -> None:
+    def __init__(self, listen: str = "127.0.0.1", start_port: int = 10808) -> None:
         self.listen = listen
         self.start_port = start_port
 
-    async def __aenter__(self) -> SingBoxEndpoint:
+    async def start(self) -> SingBoxEndpoint:
         return SingBoxEndpoint(listen=self.listen, start_port=self.start_port)
+
+    async def stop(self) -> None:
+        pass
+
+
+class RunnerAbstraction:
+    """Bridge Pattern - Abstraction."""
+
+    def __init__(self, implementation: RunnerImplementation) -> None:
+        self._impl = implementation
+
+    async def __aenter__(self) -> SingBoxEndpoint:
+        return await self._impl.start()
 
     async def __aexit__(
         self,
@@ -150,4 +138,4 @@ class FakeSingBoxRunner:
         exc: BaseException | None,
         tb: Any,
     ) -> None:
-        return None
+        await self._impl.stop()

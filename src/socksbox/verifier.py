@@ -7,7 +7,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,7 @@ from socksbox.status import (
     _response_carries_forbidden,
     log_forbidden_detection,
 )
+from socksbox.verification import ProxyVerificationContext, Socks5LatencyStrategy
 
 
 async def test_socks5_latency(
@@ -31,58 +31,9 @@ async def test_socks5_latency(
     target_port: int = 80,
     timeout: float = 4.0,
 ) -> tuple[float | None, Exception | None]:
-    writer = None
-    try:
-        start_time = time.monotonic()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(proxy_host, proxy_port), timeout=timeout
-        )
-        writer.write(b"\x05\x01\x00")
-        await writer.drain()
-        res = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
-        if res != b"\x05\x00":
-            return None, ValueError(f"SOCKS5 auth rejected, server returned: {res!r}")
-        host_bytes = target_host.encode("ascii")
-        req = bytearray([0x05, 0x01, 0x00, 0x03, len(host_bytes)]) + host_bytes + target_port.to_bytes(2, "big")
-        writer.write(req)
-        await writer.drain()
-        resp_header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
-        if resp_header[0] != 5:
-            return None, ValueError(f"SOCKS5 invalid protocol version in reply: {resp_header[0]}")
-        if resp_header[1] != 0:
-            return None, ValueError(f"SOCKS5 connection failed (REP={resp_header[1]})")
-        atyp = resp_header[3]
-        if atyp == 1:
-            await asyncio.wait_for(reader.readexactly(6), timeout=timeout)
-        elif atyp == 3:
-            len_byte = await asyncio.wait_for(reader.readexactly(1), timeout=timeout)
-            await asyncio.wait_for(reader.readexactly(len_byte[0] + 2), timeout=timeout)
-        elif atyp == 4:
-            await asyncio.wait_for(reader.readexactly(18), timeout=timeout)
-        else:
-            return None, ValueError(f"SOCKS5 unknown ATYP: {atyp}")
-        http_req = (
-            f"GET /generate_204 HTTP/1.1\r\n"
-            f"Host: {target_host}\r\n"
-            "User-Agent: sing-box-latency-tester\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("ascii")
-        writer.write(http_req)
-        await writer.drain()
-        resp_data = await asyncio.wait_for(reader.read(100), timeout=timeout)
-        if not resp_data or b"HTTP/1." not in resp_data:
-            return None, ValueError(f"Invalid target HTTP response: {resp_data!r}")
-        latency = (time.monotonic() - start_time) * 1000
-        return latency, None
-    except Exception as exc:
-        return None, exc
-    finally:
-        if writer is not None:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+    """Shorthand delegation to the Socks5LatencyStrategy for tests/compatibility."""
+    strategy = Socks5LatencyStrategy()
+    return await strategy.measure(proxy_host, proxy_port, target_host, target_port, timeout)
 
 
 async def measure_proxy_average_latency(
@@ -95,44 +46,15 @@ async def measure_proxy_average_latency(
     timeout: float = 4.0,
     verbose: bool = False,
 ) -> tuple[float, dict[str, Any]]:
-    latencies = []
-    attempts: list[dict[str, Any]] = []
-    last_error = None
-    for attempt in range(1, tries + 1):
-        lat, err = await test_socks5_latency(
-            proxy_host, proxy_port, target_host=target_host, target_port=target_port, timeout=timeout
-        )
-        attempt_record: dict[str, Any] = {"attempt": attempt}
-        if lat is not None:
-            latencies.append(lat)
-            attempt_record["status"] = "ok"
-            attempt_record["latency_ms"] = round(lat, 1)
-        else:
-            attempt_record["status"] = "failed"
-        if err is not None:
-            last_error = err
-            attempt_record["error_type"] = type(err).__name__
-            attempt_record["error"] = str(err)
-        attempts.append(attempt_record)
-        await asyncio.sleep(delay)
-    diagnostic: dict[str, Any] = {
-        "status": "ok" if latencies else "failed",
-        "tries": tries,
-        "target_host": target_host,
-        "target_port": target_port,
-        "timeout": timeout,
-        "attempts": attempts,
-    }
-    if latencies:
-        avg_latency = sum(latencies) / len(latencies)
-        diagnostic["latency_ms"] = round(avg_latency, 1)
-        return avg_latency, diagnostic
-    if verbose and last_error:
-        print(f"[Debug] Port {proxy_port} failed: {type(last_error).__name__}: {last_error}", file=sys.stderr)
-    if last_error:
-        diagnostic["error_type"] = type(last_error).__name__
-        diagnostic["error"] = str(last_error)
-    return float("inf"), diagnostic
+    """Shorthand delegation to ProxyVerificationContext and Socks5LatencyStrategy."""
+    # Create a mock proxy to run the context on
+    from socksbox.models import ProxyInfoBuilder
+    p = ProxyInfoBuilder().build()
+    ctx = ProxyVerificationContext(p)
+    strategy = Socks5LatencyStrategy()
+    await ctx.verify(proxy_host, proxy_port, strategy, tries, delay, timeout, verbose)
+    diag = p.diagnostics.get("verify", {})
+    return p.latency_ms, diag
 
 
 async def curl_ipinfo_forbidden_check(
@@ -144,11 +66,6 @@ async def curl_ipinfo_forbidden_check(
     """Run ``curl --socks5 <proxy_host>:<proxy_port> ipinfo.io/json`` and detect
     the 403 Forbidden block page that Google serves when the proxy's outbound
     IP has been flagged.
-
-    Returns a tuple of ``(is_blocked, http_status)``. ``is_blocked`` is True
-    only when the response carries the exact forbidden message markers and an
-    HTTP status of 403. The check fires immediately on the first response —
-    no retries are performed.
     """
     cmd = [
         curl_bin,
@@ -188,8 +105,6 @@ async def curl_ipinfo_forbidden_check(
 
     is_blocked = status == IPINFO_FORBIDDEN_STATUS and _response_carries_forbidden(body)
     return is_blocked, status
-
-
 
 
 def _build_config_for_indices(
@@ -337,6 +252,7 @@ async def verify_proxies(
                         target_host=target_host, target_port=target_port,
                         tries=tries, timeout=timeout, verbose=verbose,
                     )
+                    proxies[port_map[seq]].latency_ms = avg_lat
                     proxies[port_map[seq]].diagnostics["verify"] = diagnostic
                     completed += 1
                     print(f"Progress: {completed}/{total} processed...", end="\r", file=sys.stderr)

@@ -2,30 +2,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 import sys
-import traceback
 from pathlib import Path
 
-from socksbox.config_gen import generate_singbox_config
-from socksbox.downloader import print_pass_fail_summary, run_download_verification
-from socksbox.enricher import enrich_proxies
-from socksbox.exporter import export_all
+from socksbox.config import AppConfig
+from socksbox.status import DEFAULT_AUDIT_LOG_NAME
 from socksbox.models import ProxyInfo
 from socksbox.runner import SubprocessSingBoxRunner
-from socksbox.sources import DEFAULT_SOURCES
-from socksbox.status import DEFAULT_AUDIT_LOG_NAME
-from socksbox.verifier import verify_proxies
-
-DEFAULT_INPUT = "https://github.com/ebrasha/free-v2ray-public-list/raw/refs/heads/main/V2Ray-Config-By-EbraSha.txt"
-
-
-def parse_tokens(raw: str) -> list[str] | None:
-    if not raw:
-        return None
-    tokens = [t.strip() for t in raw.split(",") if t.strip()]
-    return tokens or None
+from socksbox.enricher import enrich_proxies
+from socksbox.config_gen import generate_singbox_config
+from socksbox.pipeline import (
+    ConfigCommand,
+    EnrichCommand,
+    ParseCommand,
+    RunCommand,
+    VerifyCommand,
+)
 
 
 async def enrich_with_live_sing_box(
@@ -61,36 +54,8 @@ async def enrich_with_live_sing_box(
         )
 
 
-def write_errors(errors: list[dict], output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / "errors.json"
-    path.write_text(json.dumps(errors, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"Logged {len(errors)} source error(s) to {path}", file=sys.stderr)
-    return path
-
-
-def resolve_audit_log_path(audit_log: str | None, output_dir: Path | None) -> Path | None:
-    """Resolve where the forbidden-detection audit log should be written.
-
-    Priority order:
-      1. Explicit ``--audit-log`` argument (always honored, even if empty
-         string disables it).
-      2. ``<output_dir>/<DEFAULT_AUDIT_LOG_NAME>`` when an output directory
-         is provided.
-      3. ``<cwd>/<DEFAULT_AUDIT_LOG_NAME>`` as a last-resort default.
-    """
-    if audit_log is not None:
-        if not audit_log.strip():
-            return None
-        return Path(audit_log)
-    base = output_dir if output_dir is not None else Path(".")
-    return base / DEFAULT_AUDIT_LOG_NAME
-
-
-def _dump_errors(parse_records: list[dict], issues: list[dict], output_dir: Path) -> None:
-    combined = parse_records + issues
-    if combined:
-        write_errors(combined, output_dir)
+import traceback
+from socksbox.sources import DEFAULT_SOURCES
 
 
 def load_sources(verify_ssl: bool = True) -> tuple[list[ProxyInfo], list[dict], list[dict]]:
@@ -141,6 +106,69 @@ def load_sources(verify_ssl: bool = True) -> tuple[list[ProxyInfo], list[dict], 
     return all_proxies, parse_records, issues
 
 
+def parse_tokens(raw: str) -> list[str] | None:
+    if not raw:
+        return None
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    return tokens or None
+
+
+def resolve_audit_log_path(audit_log: str | None, output_dir: Path | None) -> Path | None:
+    """Resolve where the forbidden-detection audit log should be written."""
+    if audit_log is not None:
+        if not audit_log.strip():
+            return None
+        return Path(audit_log)
+    base = output_dir if output_dir is not None else Path(".")
+    return base / DEFAULT_AUDIT_LOG_NAME
+
+
+async def cmd_run(args: argparse.Namespace) -> int:
+    settings = vars(args)
+    settings["audit_log_path"] = resolve_audit_log_path(args.audit_log, Path(args.output_dir))
+    # Update global singleton configuration
+    AppConfig.instance().update_from_dict(settings)
+    command = RunCommand(settings)
+    return await command.execute()
+
+
+async def cmd_verify(args: argparse.Namespace) -> int:
+    settings = vars(args)
+    output_path = Path(args.output)
+    settings["audit_log_path"] = resolve_audit_log_path(
+        args.audit_log, output_path.parent if output_path.parent else Path(".")
+    )
+    # Update global singleton configuration
+    AppConfig.instance().update_from_dict(settings)
+    command = VerifyCommand(settings)
+    return await command.execute()
+
+
+async def cmd_enrich(args: argparse.Namespace) -> int:
+    settings = vars(args)
+    settings["audit_log_path"] = resolve_audit_log_path(args.audit_log, Path("."))
+    # Update global singleton configuration
+    AppConfig.instance().update_from_dict(settings)
+    command = EnrichCommand(settings)
+    return await command.execute()
+
+
+def cmd_parse(args: argparse.Namespace) -> int:
+    settings = vars(args)
+    # Update global singleton configuration
+    AppConfig.instance().update_from_dict(settings)
+    command = ParseCommand(settings)
+    return asyncio.run(command.execute())
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    settings = vars(args)
+    # Update global singleton configuration
+    AppConfig.instance().update_from_dict(settings)
+    command = ConfigCommand(settings)
+    return asyncio.run(command.execute())
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--start-port", type=int, default=10808, help="First SOCKS port (default: 10808)")
     parser.add_argument("--listen", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
@@ -164,227 +192,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
 
-async def cmd_run(args: argparse.Namespace) -> int:
-    output_dir = Path(args.output_dir)
-    audit_log_path = resolve_audit_log_path(args.audit_log, output_dir)
-    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
-    if not proxies:
-        _dump_errors(parse_records, issues, output_dir)
-        print("No valid proxies from any source.", file=sys.stderr)
-        return 1
-
-    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s).", file=sys.stderr)
-
-    try:
-        proxies = await verify_proxies(
-            proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
-            tries=args.tries, timeout=args.timeout, concurrency=args.concurrency,
-            target_host=args.target_host, target_port=args.target_port, verbose=args.verbose,
-            audit_log_path=audit_log_path,
-        )
-    except Exception as exc:
-        issues.append({"source": "all", "stage": "verify", "error": str(exc),
-                        "traceback": traceback.format_exc()})
-        print(f"[error] verify stage: {exc}", file=sys.stderr)
-
-    working = [p for p in proxies if p.working]
-    print(f"Verification complete: {len(working)}/{len(proxies)} working.", file=sys.stderr)
-
-    if not working:
-        print("No working proxies. Skipping enrichment and export.", file=sys.stderr)
-        _dump_errors(parse_records, issues, output_dir)
-        return 1
-
-    if not args.no_enrich:
-        try:
-            proxies = await enrich_with_live_sing_box(
-                proxies,
-                start_port=args.start_port,
-                listen=args.listen,
-                sing_box=args.sing_box,
-                concurrency=min(args.concurrency, 50),
-                tokens=parse_tokens(args.ipinfo_token),
-                verbose=args.verbose,
-                audit_log_path=audit_log_path,
-            )
-        except Exception as exc:
-            issues.append({"source": "all", "stage": "enrich", "error": str(exc),
-                            "traceback": traceback.format_exc()})
-            print(f"[error] enrich stage: {exc}", file=sys.stderr)
-
-    config = generate_singbox_config(working, start_port=args.start_port, listen=args.listen)
-    export_all(proxies, config, output_dir, start_port=args.start_port, issues=issues)
-
-    _dump_errors(parse_records, issues, output_dir)
-
-    if args.download_test:
-        print("\n=== Concurrent download verification ===", file=sys.stderr)
-        try:
-            download_report = await run_download_verification(
-                working,
-                start_port=args.start_port,
-                listen=args.listen,
-                sing_box=args.sing_box,
-                url=args.download_url,
-                timeout=args.download_timeout,
-                concurrency=max(1, args.download_concurrency),
-                output_dir=output_dir,
-                verbose=args.verbose,
-            )
-        except Exception as exc:
-            issues.append({
-                "source": "all",
-                "stage": "download_test",
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            })
-            print(f"[error] download_test stage: {exc}", file=sys.stderr)
-        else:
-            print_pass_fail_summary(download_report)
-            for err in download_report.get("errors", []):
-                issues.append({
-                    "source": "download_test",
-                    "stage": err.get("stage", "download"),
-                    "kind": err.get("error_type"),
-                    "label": err.get("label"),
-                    "socks_port": err.get("socks_port"),
-                    "error": err.get("error"),
-                    "traceback": err.get("traceback"),
-                })
-            if download_report.get("demoted"):
-                final_working = [p for p in working if p.working]
-                final_failed = [p for p in working if not p.working]
-                print(
-                    f"Re-exporting after demotion: {len(final_working)} working / "
-                    f"{len(final_failed)} failed.",
-                    file=sys.stderr,
-                )
-                proxies = working
-                config = generate_singbox_config(final_working, start_port=args.start_port, listen=args.listen)
-                export_all(proxies, config, output_dir, start_port=args.start_port, issues=issues)
-            _dump_errors(parse_records, issues, output_dir)
-
-    return 0
-
-
-async def cmd_verify(args: argparse.Namespace) -> int:
-    output_path = Path(args.output)
-    audit_log_path = resolve_audit_log_path(
-        args.audit_log, output_path.parent if output_path.parent else Path(".")
-    )
-    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
-    if not proxies:
-        _dump_errors(parse_records, issues, Path("."))
-        print("No valid proxies from any source.", file=sys.stderr)
-        return 1
-
-    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s).", file=sys.stderr)
-
-    proxies = await verify_proxies(
-        proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
-        tries=args.tries, timeout=args.timeout, concurrency=args.concurrency,
-        target_host=args.target_host, target_port=args.target_port, verbose=args.verbose,
-        audit_log_path=audit_log_path,
-    )
-
-    working = [p for p in proxies if p.working]
-    with output_path.open("w", encoding="utf-8") as f:
-        f.write(f"# Verified: {len(working)} working / {len(proxies)} total\n\n")
-        for p in working:
-            f.write(f"{p.link}\n")
-
-    print(f"Saved {len(working)} working proxies to {output_path}.", file=sys.stderr)
-    if working:
-        print("\nTop 10:", file=sys.stderr)
-        for rank, p in enumerate(working[:10], 1):
-            label = " ".join(str(p.label).split())
-            print(f"  {rank:2d}. {p.latency_ms:6.1f}ms | {p.protocol:12s} | {label}", file=sys.stderr)
-
-    _dump_errors(parse_records, issues, output_path.parent or Path("."))
-    return 0
-
-
-async def cmd_enrich(args: argparse.Namespace) -> int:
-    audit_log_path = resolve_audit_log_path(args.audit_log, Path("."))
-    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
-    if not proxies:
-        _dump_errors(parse_records, issues, Path("."))
-        print("No valid proxies from any source.", file=sys.stderr)
-        return 1
-
-    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s).", file=sys.stderr)
-
-    proxies = await verify_proxies(
-        proxies, start_port=args.start_port, listen=args.listen, sing_box=args.sing_box,
-        tries=args.tries, timeout=args.timeout, concurrency=args.concurrency,
-        target_host=args.target_host, target_port=args.target_port, verbose=args.verbose,
-        audit_log_path=audit_log_path,
-    )
-
-    working = [p for p in proxies if p.working]
-    if not working:
-        print("No working proxies to enrich.", file=sys.stderr)
-        _dump_errors(parse_records, issues, Path("."))
-        return 1
-
-    proxies = await enrich_with_live_sing_box(
-        proxies,
-        start_port=args.start_port,
-        listen=args.listen,
-        sing_box=args.sing_box,
-        concurrency=min(args.concurrency, 50),
-        tokens=parse_tokens(args.ipinfo_token),
-        verbose=args.verbose,
-        audit_log_path=audit_log_path,
-    )
-
-    for p in working:
-        cc = p.country_code or "?"
-        print(f"  {p.latency_ms:6.1f}ms | {cc:2s} | {p.protocol:12s} | {p.label}")
-
-    _dump_errors(parse_records, issues, Path("."))
-    return 0
-
-
-def cmd_parse(args: argparse.Namespace) -> int:
-    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
-    if not proxies:
-        _dump_errors(parse_records, issues, Path("."))
-        print("No valid proxies from any source.", file=sys.stderr)
-        return 1
-
-    print(f"Total: {len(proxies)} proxies from 3 hardcoded source(s):\n")
-    from collections import Counter
-    by_proto = Counter(p.protocol for p in proxies)
-    for proto, count in by_proto.most_common():
-        print(f"  {proto}: {count}")
-    print(f"\nFirst 5:")
-    for p in proxies[:5]:
-        label = " ".join(str(p.label).split())
-        print(f"  {p.protocol:12s} | {label}")
-
-    _dump_errors(parse_records, issues, Path("."))
-    return 0
-
-
-def cmd_config(args: argparse.Namespace) -> int:
-    proxies, parse_records, issues = load_sources(verify_ssl=not args.no_verify_ssl)
-    if not proxies:
-        _dump_errors(parse_records, issues, Path("."))
-        print("No valid proxies from any source.", file=sys.stderr)
-        return 1
-
-    config = generate_singbox_config(proxies, start_port=args.start_port, listen=args.listen, legacy_route=args.legacy_route)
-
-    output_path = Path(args.output)
-    output_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"Created {output_path} with {len(proxies)} proxies.")
-
-    _dump_errors(parse_records, issues, output_path.parent or Path("."))
-    return 0
-
-
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="SocksBox: proxy toolkit")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -429,6 +237,7 @@ def main():
         return asyncio.run(cmd_enrich(args))
     if args.command == "run":
         return asyncio.run(cmd_run(args))
+    return 1
 
 
 if __name__ == "__main__":

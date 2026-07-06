@@ -2,18 +2,34 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, List, Protocol, runtime_checkable
 
 from socksbox.models import ProxyInfo
 
 
+class ExportVisitor(ABC):
+    """Visitor Pattern: Interface for visiting proxy data formats."""
+
+    @abstractmethod
+    def visit_working(self, proxies: list[ProxyInfo]) -> Any:
+        ...
+
+    @abstractmethod
+    def visit_failed(self, proxies: list[ProxyInfo]) -> Any:
+        ...
+
+    @abstractmethod
+    def visit_config(self, config: dict[str, Any]) -> Any:
+        ...
+
+    @abstractmethod
+    def visit_issues(self, issues: list[dict[str, Any]]) -> Any:
+        ...
+
+
 @runtime_checkable
 class Exporter(Protocol):
-    """Protocol for an output artifact exporter.
-
-    Implementations receive the full result set and write a single artifact
-    (or cohesive group of artifacts) under ``output_dir``.
-    """
+    """Protocol for an output artifact exporter."""
 
     def write(
         self,
@@ -23,24 +39,11 @@ class Exporter(Protocol):
         start_port: int,
         issues: list[dict[str, Any]],
     ) -> None:
-        """Write this exporter's artifact(s) to ``output_dir``.
-
-        Args:
-            proxies: All proxies produced by the pipeline.
-            config: The resolved configuration object.
-            output_dir: Directory where artifacts should be written.
-            start_port: Base port assigned to the first proxy.
-            issues: Diagnostics/issues collected during execution.
-        """
         ...
 
 
 class BaseExporter(ABC):
-    """Optional base class for concrete exporters.
-
-    Provides small helpers for working with the proxy list without
-    importing ``exporter.py`` or other concrete modules.
-    """
+    """Optional base class for concrete exporters."""
 
     @staticmethod
     def working(proxies: list[ProxyInfo]) -> list[ProxyInfo]:
@@ -63,3 +66,38 @@ class BaseExporter(ABC):
     ) -> None:
         """Implementing exporters must override this method."""
         raise NotImplementedError
+
+
+class CompositeExporter(BaseExporter):
+    """Composite Pattern: Treats a collection of exporters as a single exporter."""
+
+    def __init__(self, children: List[Exporter] | None = None) -> None:
+        self._children: List[Exporter] = children or []
+
+    def add(self, exporter: Exporter) -> None:
+        if exporter not in self._children:
+            self._children.append(exporter)
+
+    def remove(self, exporter: Exporter) -> None:
+        if exporter in self._children:
+            self._children.remove(exporter)
+
+    def __len__(self) -> int:
+        return len(self._children)
+
+    def __iter__(self):
+        return iter(self._children)
+
+    def __getitem__(self, index: int) -> Exporter:
+        return self._children[index]
+
+    def write(
+        self,
+        proxies: list[ProxyInfo],
+        config: dict[str, Any],
+        output_dir: Path,
+        start_port: int,
+        issues: list[dict[str, Any]],
+    ) -> None:
+        for child in self._children:
+            child.write(proxies, config, output_dir, start_port, issues)

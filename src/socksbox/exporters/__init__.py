@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from socksbox.exporters.base import BaseExporter, Exporter
+from socksbox.exporters.base import BaseExporter, Exporter, CompositeExporter
 from socksbox.exporters.grouped import GroupedExporter
 from socksbox.exporters.json_exporter import (
     ConfigExporter,
@@ -13,7 +13,7 @@ from socksbox.exporters.txt import (
     WorkingTxtExporter,
 )
 
-DEFAULT_EXPORTERS: list[Exporter] = [
+DEFAULT_EXPORTERS = CompositeExporter([
     AllTxtExporter(),
     WorkingTxtExporter(),
     Top10TxtExporter(),
@@ -21,11 +21,12 @@ DEFAULT_EXPORTERS: list[Exporter] = [
     ConfigExporter(),
     SummaryExporter(),
     DiagnosticsExporter(),
-]
+])
 
 __all__ = [
     "BaseExporter",
     "Exporter",
+    "CompositeExporter",
     "AllTxtExporter",
     "WorkingTxtExporter",
     "Top10TxtExporter",

@@ -18,11 +18,14 @@ def export_all(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for exporter in DEFAULT_EXPORTERS:
-        exporter.write(proxies, config, output_dir, start_port, issues or [])
+    # Composite Pattern: delegate writing to the composite exporter (fallback to list iteration for injected mocks)
+    if hasattr(DEFAULT_EXPORTERS, "write"):
+        DEFAULT_EXPORTERS.write(proxies, config, output_dir, start_port, issues or [])
+    else:
+        for exporter in DEFAULT_EXPORTERS:
+            exporter.write(proxies, config, output_dir, start_port, issues or [])
 
     working = [p for p in proxies if p.working]
-    failed = [p for p in proxies if not p.working]
 
     by_protocol: dict[str, list[ProxyInfo]] = defaultdict(list)
     by_country: dict[str, list[ProxyInfo]] = defaultdict(list)
