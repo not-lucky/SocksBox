@@ -25,6 +25,18 @@ class VerifyStage(PipelineStage):
         verbose = context.settings.get("verbose", False)
         audit_log_path = context.settings.get("audit_log_path")
 
+        from socksbox.config import AppConfig
+        command = context.settings.get("command")
+        no_enrich = context.settings.get("no_enrich") or AppConfig.instance().no_enrich
+        enrich_providers = context.settings.get("enrich_providers") or AppConfig.instance().enrich_providers
+        active_providers = [p.strip() for p in enrich_providers.split(",") if p.strip()]
+
+        skip_ipinfo_check = False
+        if no_enrich or ("ipinfo" not in active_providers):
+            skip_ipinfo_check = True
+        elif command in ("run", "enrich"):
+            skip_ipinfo_check = True
+
         try:
             context.proxies = await verify_proxies(
                 context.proxies,
@@ -38,6 +50,7 @@ class VerifyStage(PipelineStage):
                 target_port=target_port,
                 verbose=verbose,
                 audit_log_path=audit_log_path,
+                skip_ipinfo_check=skip_ipinfo_check,
             )
         except Exception as exc:
             context.issues.append({

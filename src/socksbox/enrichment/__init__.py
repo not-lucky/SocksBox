@@ -5,6 +5,10 @@ from socksbox.enrichment.enrichers import (
     GeoEnricher,
     ProxyBatchIterator,
     ProxyEnricher,
+    EnrichmentProvider,
+    PROVIDER_REGISTRY,
+    IpInfoProvider,
+    AbuseIPDBProvider,
 )
 
 __all__ = [
@@ -12,4 +16,8 @@ __all__ = [
     "BaseEnricher",
     "GeoEnricher",
     "ProxyBatchIterator",
+    "EnrichmentProvider",
+    "PROVIDER_REGISTRY",
+    "IpInfoProvider",
+    "AbuseIPDBProvider",
 ]

@@ -170,43 +170,71 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--start-port", type=int, default=10808, help="First SOCKS port (default: 10808)")
-    parser.add_argument("--listen", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
-    parser.add_argument("--concurrency", type=int, default=100, help="Max concurrent operations (default: 100)")
-    parser.add_argument("--tries", type=int, default=5, help="Latency test attempts per proxy (default: 5)")
-    parser.add_argument("--timeout", type=float, default=4.0, help="Timeout per attempt in seconds (default: 4.0)")
-    parser.add_argument("--target-host", default="cp.cloudflare.com", help="Latency test target host")
-    parser.add_argument("--target-port", type=int, default=80, help="Latency test target port")
-    parser.add_argument("--sing-box", default="sing-box", help="Path to sing-box binary")
-    parser.add_argument("--ipinfo-token", default=os.environ.get("IPINFO_TOKEN", ""), help="ipinfo.io API token(s), comma-separated to cycle through multiple (or set IPINFO_TOKEN env var)")
-    parser.add_argument("--no-enrich", action="store_true", help="Skip geo enrichment step")
-    parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification (INSECURE, use only for testing)")
+    cfg = AppConfig.instance()
+    parser.add_argument("--start-port", type=int, default=cfg.start_port, help=f"First SOCKS port (default: {cfg.start_port})")
+    parser.add_argument("--listen", default=cfg.listen, help=f"Listen address (default: {cfg.listen})")
+    parser.add_argument("--concurrency", type=int, default=cfg.concurrency, help=f"Max concurrent operations (default: {cfg.concurrency})")
+    parser.add_argument("--tries", type=int, default=cfg.tries, help=f"Latency test attempts per proxy (default: {cfg.tries})")
+    parser.add_argument("--timeout", type=float, default=cfg.timeout, help=f"Timeout per attempt in seconds (default: {cfg.timeout})")
+    parser.add_argument("--target-host", default=cfg.target_host, help=f"Latency test target host (default: {cfg.target_host})")
+    parser.add_argument("--target-port", type=int, default=cfg.target_port, help=f"Latency test target port (default: {cfg.target_port})")
+    parser.add_argument("--sing-box", default=cfg.sing_box, help=f"Path to sing-box binary (default: {cfg.sing_box})")
+    parser.add_argument("--ipinfo-token", default=cfg.ipinfo_token, help="ipinfo.io API token(s), comma-separated to cycle through multiple (or set IPINFO_TOKEN env var)")
+    parser.add_argument("--no-enrich", action="store_true", default=cfg.no_enrich, help="Skip geo enrichment step")
+    parser.add_argument("--no-verify-ssl", action="store_true", default=cfg.no_verify_ssl, help="Disable SSL certificate verification (INSECURE, use only for testing)")
     parser.add_argument(
-        "--audit-log", default=None,
+        "--audit-log", default=cfg.audit_log,
         help=(
             "Path to the audit log that records every ipinfo.io 403 Forbidden "
             "detection (proxy IP, SOCKS port, timestamp). Defaults to "
             "<output_dir>/forbidden_detections.log. Pass an empty string to disable."
         ),
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("-v", "--verbose", action="store_true", default=cfg.verbose, help="Verbose output")
+
+
+def load_env_file(path: Path | None = None) -> None:
+    """Load key-value pairs from a .env file into os.environ if present."""
+    if path is None:
+        path = Path(".env")
+    if not path.is_file():
+        return
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    # Strip quotes if present
+                    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                        val = val[1:-1]
+                    if key:
+                        os.environ.setdefault(key, val)
+    except Exception:
+        pass
 
 
 def main() -> int:
+    load_env_file()
+    cfg = AppConfig.instance()
     parser = argparse.ArgumentParser(description="SocksBox: proxy toolkit")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     p_run = subparsers.add_parser("run", help="Full pipeline: parse, verify, enrich, export")
     add_common_args(p_run)
-    p_run.add_argument("--output-dir", default="output", help="Output directory (default: output/)")
-    p_run.add_argument("--download-test", action="store_true",
+    p_run.add_argument("--output-dir", default=cfg.output_dir, help=f"Output directory (default: {cfg.output_dir})")
+    p_run.add_argument("--download-test", action="store_true", default=cfg.download_test,
                        help="Run an opt-in, concurrent download verification after export to validate working proxies (off by default to keep the pipeline non-intrusive)")
-    p_run.add_argument("--download-url", default="https://speed.cloudflare.com/__down?bytes=1048576",
-                       help="Test URL used for the download verification (default: 1 MiB from Cloudflare)")
-    p_run.add_argument("--download-timeout", type=float, default=30.0,
-                       help="Per-proxy timeout in seconds for the download verification (default: 30)")
-    p_run.add_argument("--download-concurrency", type=int, default=5,
-                       help="Max in-flight download verifications (default: 5). Failed proxies are marked not working and excluded from exports.")
+    p_run.add_argument("--download-url", default=cfg.download_url,
+                       help=f"Test URL used for the download verification (default: {cfg.download_url})")
+    p_run.add_argument("--download-timeout", type=float, default=cfg.download_timeout,
+                       help=f"Per-proxy timeout in seconds for the download verification (default: {cfg.download_timeout})")
+    p_run.add_argument("--download-concurrency", type=int, default=cfg.download_concurrency,
+                       help=f"Max in-flight download verifications (default: {cfg.download_concurrency})")
 
     p_verify = subparsers.add_parser("verify", help="Parse and verify proxies")
     add_common_args(p_verify)
@@ -216,14 +244,14 @@ def main() -> int:
     add_common_args(p_enrich)
 
     p_parse = subparsers.add_parser("parse", help="Parse and display proxy info")
-    p_parse.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification (INSECURE, use only for testing)")
+    p_parse.add_argument("--no-verify-ssl", action="store_true", default=cfg.no_verify_ssl, help="Disable SSL certificate verification (INSECURE, use only for testing)")
 
     p_config = subparsers.add_parser("config", help="Generate sing-box config (no verification)")
     p_config.add_argument("-o", "--output", default="config.json", help="Output config file")
-    p_config.add_argument("--start-port", type=int, default=10808)
-    p_config.add_argument("--listen", default="127.0.0.1")
-    p_config.add_argument("--legacy-route", action="store_true")
-    p_config.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification (INSECURE, use only for testing)")
+    p_config.add_argument("--start-port", type=int, default=cfg.start_port)
+    p_config.add_argument("--listen", default=cfg.listen)
+    p_config.add_argument("--legacy-route", action="store_true", default=cfg.legacy_route)
+    p_config.add_argument("--no-verify-ssl", action="store_true", default=cfg.no_verify_ssl, help="Disable SSL certificate verification (INSECURE, use only for testing)")
 
     args = parser.parse_args()
 

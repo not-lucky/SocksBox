@@ -145,6 +145,7 @@ async def verify_proxies(
     target_port: int = 80,
     verbose: bool = False,
     audit_log_path: Path | None = None,
+    skip_ipinfo_check: bool = False,
 ) -> list[ProxyInfo]:
     if not proxies:
         return proxies
@@ -274,7 +275,7 @@ async def verify_proxies(
             working_real_indices = [
                 real_idx for real_idx, lat in results if lat != float("inf")
             ]
-            if working_real_indices:
+            if working_real_indices and not skip_ipinfo_check:
                 print(
                     f"Running ipinfo.io forbidden-response check on "
                     f"{len(working_real_indices)} working proxies...",

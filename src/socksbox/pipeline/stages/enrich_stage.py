@@ -5,6 +5,7 @@ import traceback
 from socksbox.pipeline.stage import PipelineStage
 from socksbox.pipeline.context import PipelineContext
 from socksbox.enricher import enrich_proxies
+from socksbox.config import AppConfig
 
 
 def parse_tokens(raw: str) -> list[str] | None:
@@ -30,14 +31,21 @@ class EnrichStage(PipelineStage):
         listen = context.settings.get("listen", "127.0.0.1")
         sing_box = context.settings.get("sing_box", "sing-box")
         concurrency = context.settings.get("concurrency", 100)
-        ipinfo_token = context.settings.get("ipinfo_token", "")
+        ipinfo_token = context.settings.get("ipinfo_token") or AppConfig.instance().ipinfo_token
+        abuseipdb_token = context.settings.get("abuseipdb_token") or AppConfig.instance().abuseipdb_token
+        enrich_providers = context.settings.get("enrich_providers") or AppConfig.instance().enrich_providers
         verbose = context.settings.get("verbose", False)
         audit_log_path = context.settings.get("audit_log_path")
 
-        # Parse tokens
-        tokens = None
+        # Parse active providers
+        active_providers = [p.strip() for p in enrich_providers.split(",") if p.strip()]
+
+        # Parse tokens for each provider
+        provider_tokens: dict[str, list[str]] = {}
         if ipinfo_token:
-            tokens = [t.strip() for t in ipinfo_token.split(",") if t.strip()]
+            provider_tokens["ipinfo"] = [t.strip() for t in ipinfo_token.split(",") if t.strip()]
+        if abuseipdb_token:
+            provider_tokens["abuseipdb"] = [t.strip() for t in abuseipdb_token.split(",") if t.strip()]
 
         try:
             # We must run with live sing-box endpoint!
@@ -60,9 +68,10 @@ class EnrichStage(PipelineStage):
                     start_port=endpoint.start_port,
                     listen=endpoint.listen,
                     concurrency=min(concurrency, 50),
-                    tokens=tokens,
                     verbose=verbose,
                     audit_log_path=audit_log_path,
+                    provider_tokens=provider_tokens,
+                    active_providers=active_providers,
                 )
         except Exception as exc:
             context.issues.append({

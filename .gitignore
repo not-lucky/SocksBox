@@ -13,3 +13,4 @@ wheels/
 output/
 temp_config.json
 sorted_links.txt
+.env

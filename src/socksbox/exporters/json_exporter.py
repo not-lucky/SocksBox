@@ -155,6 +155,7 @@ class DiagnosticsExporter(BaseExporter):
                     "country_code": p.country_code,
                     "country": p.country,
                     "diagnostics": p.diagnostics,
+                    "raw_geo": p.raw_geo,
                 }
                 for i, p in enumerate(proxies)
             ],

@@ -11,11 +11,27 @@ def generate_singbox_config(
     listen: str = "127.0.0.1",
     legacy_route: bool = False,
 ) -> dict[str, Any]:
+    # Sort proxies: lower abuseConfidenceScore first; if tie, lower latency_ms first
+    def get_sort_key(p: ProxyInfo) -> tuple[int, float]:
+        score = 0
+        if isinstance(p.raw_geo, dict) and "abuseipdb" in p.raw_geo:
+            abuse_data = p.raw_geo["abuseipdb"]
+            if isinstance(abuse_data, dict):
+                val = abuse_data.get("data", {}).get("abuseConfidenceScore")
+                if val is not None:
+                    try:
+                        score = int(val)
+                    except (ValueError, TypeError):
+                        pass
+        return (score, p.latency_ms)
+
+    sorted_proxies = sorted(proxies, key=get_sort_key)
+
     inbounds = []
     outbounds = []
     route_rules = []
 
-    for index, proxy in enumerate(proxies):
+    for index, proxy in enumerate(sorted_proxies):
         listen_port = start_port + index
         inbound_tag = f"socks-{index:03d}"
         outbound_tag = f"proxy-{index:03d}"

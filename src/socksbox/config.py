@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, List, Protocol
 
 
@@ -29,19 +30,29 @@ class AppConfig:
 
     def _init_defaults(self) -> None:
         self._observers: List[ConfigObserver] = []
-        self.start_port = 10808
-        self.listen = "127.0.0.1"
-        self.concurrency = 100
-        self.tries = 5
-        self.timeout = 4.0
-        self.target_host = "cp.cloudflare.com"
-        self.target_port = 80
-        self.sing_box = "sing-box"
-        self.ipinfo_token = ""
-        self.no_enrich = False
-        self.no_verify_ssl = False
-        self.audit_log = None
-        self.verbose = False
+        self.start_port = int(os.environ.get("START_PORT", "10808"))
+        self.listen = os.environ.get("LISTEN", "127.0.0.1")
+        self.concurrency = int(os.environ.get("CONCURRENCY", "100"))
+        self.tries = int(os.environ.get("TRIES", "5"))
+        self.timeout = float(os.environ.get("TIMEOUT", "4.0"))
+        self.target_host = os.environ.get("TARGET_HOST", "cp.cloudflare.com")
+        self.target_port = int(os.environ.get("TARGET_PORT", "80"))
+        self.sing_box = os.environ.get("SING_BOX", "sing-box")
+        self.ipinfo_token = os.environ.get("IPINFO_TOKEN", "")
+        self.abuseipdb_token = os.environ.get("ABUSEIPDB_TOKEN", "")
+        self.enrich_providers = os.environ.get("ENRICH_PROVIDERS", "ipinfo")
+        self.no_enrich = os.environ.get("NO_ENRICH", "").lower() in ("true", "1")
+        self.no_verify_ssl = os.environ.get("NO_VERIFY_SSL", "").lower() in ("true", "1")
+        self.audit_log = os.environ.get("AUDIT_LOG", None)
+        self.verbose = os.environ.get("VERBOSE", "").lower() in ("true", "1")
+        
+        # Extra and stage-specific configuration
+        self.output_dir = os.environ.get("OUTPUT_DIR", "output")
+        self.download_test = os.environ.get("DOWNLOAD_TEST", "").lower() in ("true", "1")
+        self.download_url = os.environ.get("DOWNLOAD_URL", "https://speed.cloudflare.com/__down?bytes=1048576")
+        self.download_timeout = float(os.environ.get("DOWNLOAD_TIMEOUT", "30.0"))
+        self.download_concurrency = int(os.environ.get("DOWNLOAD_CONCURRENCY", "5"))
+        self.legacy_route = os.environ.get("LEGACY_ROUTE", "").lower() in ("true", "1")
 
     def update_from_dict(self, data: dict[str, Any]) -> None:
         for k, v in data.items():
